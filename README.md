@@ -28,9 +28,10 @@ assistant.
 13. [State Management](#13-state-management)
 14. [Configuration Reference](#14-configuration-reference)
 15. [Running the System](#15-running-the-system)
-16. [Diagram Source Material](#16-diagram-source-material)
-17. [Known Limitations](#17-known-limitations)
-18. [Glossary](#18-glossary)
+16. [Deployment](#16-deployment)
+17. [Diagram Source Material](#17-diagram-source-material)
+18. [Known Limitations](#18-known-limitations)
+19. [Glossary](#19-glossary)
 
 ---
 
@@ -1110,14 +1111,14 @@ superior→inferior, and normalises labels (`l1` → `L1`).
 | `PORT` | `5001` | API port (**not 5000** — macOS AirPlay holds it) |
 | `NODE_ENV` | `development` | Controls error verbosity |
 | `MONGODB_URI` | `mongodb://localhost:27017/spinevision` | Primary DB target |
-| `USE_EMBEDDED_MONGO` | `true` | Start an embedded `mongod` if the URI is unreachable |
+| `USE_EMBEDDED_MONGO` | `false` | Opt-in: start an embedded `mongod` if the URI is unreachable. Refused outright when `NODE_ENV=production`, so a bad URI fails loudly instead of coming up on an empty throwaway database |
 | `EMBEDDED_MONGO_PORT` | `27018` | Embedded instance port |
 | `EMBEDDED_MONGO_DBPATH` | `./.mongo-data` | Persistent data path |
 | `JWT_SECRET` | — | Access token secret (256-bit hex) |
 | `JWT_REFRESH_SECRET` | — | Refresh token secret (**different**) |
 | `ACCESS_TOKEN_EXPIRY` | `15m` | |
 | `REFRESH_TOKEN_EXPIRY` | `7d` | |
-| `CORS_ORIGIN` | `http://localhost:5173` | Comma-separated allow-list |
+| `CORS_ORIGIN` | `http://localhost:5173` | Comma-separated allow-list. Compared case-insensitively and ignoring a trailing slash. A single `*` allows any origin |
 | `UPLOAD_DIR` | `./uploads` | Upload root |
 | `MAX_UPLOAD_BYTES` | `10485760` | 10 MB |
 | `PYTHON_PATH` | `../ml/venv/bin/python3` | Resolved against `backend/` |
@@ -1125,6 +1126,7 @@ superior→inferior, and normalises labels (`l1` → `L1`).
 | `ML_ENABLED` | `true` | Run the real diagnostic scripts (stage 3) |
 | `SEGMENTATION_ENABLED` | `true` | Run `segment.py` when no mask is uploaded (stage 2) |
 | `SEGMENTATION_WEIGHTS` | `models/best.pt` | Checkpoint, relative to `ML_DIR` |
+| `SEGMENTATION_WEIGHTS_URL` | — | Direct download for the checkpoint, fetched by `prestart` when the file is absent. Unset when the checkpoint ships in the image |
 | `SEGMENTATION_TIMEOUT_MS` | `180000` | |
 | `ML_SCRIPT_TIMEOUT_MS` | `120000` | Per diagnostic script |
 | `OPENAI_API_KEY` | — | Unset → template report, `503` for Q&A |
@@ -1149,6 +1151,12 @@ Two frontend constants gate features alongside the server:
 - **Port 5001** — macOS AirPlay Receiver occupies 5000.
 - **Embedded MongoDB** — `config/db.js` tries `MONGODB_URI`, then joins an
   existing embedded instance, then starts one on 27018 with persistent storage.
+  The fallback is opt-in and disabled entirely in production: a hosted instance
+  silently serving an empty database is worse than one that refuses to boot.
+- **Forgiving origin matching** — a `CORS_ORIGIN` pasted from a hosting
+  dashboard with a trailing slash is the same origin the browser sends. Matching
+  it strictly turned that into an unexplained network error in the client, so
+  both sides are normalised and a rejection is logged and returned as `403`.
 - **`nodemon.json` ignores `uploads/`** — without it, writing `mask.json` into
   the watched tree restarts the server mid-pipeline and orphans the scan.
 - **Base font 25px** (`globals.css`) — every size is in rem, so type, spacing,
@@ -1165,7 +1173,7 @@ Two frontend constants gate features alongside the server:
 cd ml
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
-# place the checkpoint at ml/models/best.pt (git-ignored, supplied separately)
+# the checkpoint ships in the repo at ml/models/best.pt — nothing to place
 
 # Node dependencies
 cd ../backend  && npm install
@@ -1222,11 +1230,113 @@ ml/venv/bin/python ml/scripts/diagnose_compression_fracture.py \
 
 ---
 
-## 16. Diagram Source Material
+## 16. Deployment
+
+The application ships as **one image containing both runtimes** — Node and the
+Python ML stack — because the bridges invoke the diagnostic scripts with
+`child_process.execFile()`. Keeping them in one process avoids turning the ML
+layer into a network hop and a second thing to operate.
+
+### 16.1 The Image
+
+`Dockerfile` at the repository root:
+
+- `node:20-slim`, plus `python3` and `libgl1`/`libglib2.0-0`. The GL libraries
+  are not optional: `ultralytics` depends on `opencv-python` rather than the
+  headless build, so `import cv2` fails without them — and only at runtime,
+  inside the container.
+- Torch from `https://download.pytorch.org/whl/cpu`. The default wheel carries
+  the CUDA runtime, ~2.5 GB of it, none of which a CPU host can use.
+- `PYTHON_PATH=/opt/venv/bin/python3` and `ML_DIR=/app/ml` are baked in as `ENV`.
+- The checkpoint is copied in with `ml/`, so no download happens at boot.
+
+Resulting image: **~2.7 GB**. Build context must be the repository root — the
+image needs both `ml/` and `backend/`.
+
+### 16.2 Measured Resource Use
+
+| Phase | Memory |
+|---|---|
+| Idle | ~50 MiB |
+| Full scan (segmentation + 3 diagnostics + report) | **~764 MiB peak** |
+
+A 512 MB instance boots fine and then dies on the first upload, which reads as a
+pipeline bug rather than a sizing problem. **1 GB is the floor; 2 GB is the
+sensible choice.**
+
+The free-tier escape hatch is `SEGMENTATION_ENABLED=false`: the diagnostic
+scripts are numpy/OpenCV only and never import torch, so the footprint drops
+sharply — at the cost of requiring a hand-supplied mask with every upload.
+
+### 16.3 Required Configuration
+
+Beyond §14.1, a hosted instance needs:
+
+```
+NODE_ENV=production
+MONGODB_URI=<Atlas connection string, including the database name>
+USE_EMBEDDED_MONGO=false
+CORS_ORIGIN=<the frontend origin, exactly>
+```
+
+Two variables must **not** be set: `PYTHON_PATH` and `ML_DIR`. The Dockerfile
+already points them at the in-image venv, and overriding them with the
+development values silently breaks both ML bridges — the interpreter path simply
+does not exist in the container.
+
+A common way to hit this is `docker run --env-file backend/.env`, which
+overrides `ENV`. For a local container run:
+
+```bash
+docker run --rm -p 5002:5001 --env-file backend/.env \
+  -e PYTHON_PATH=/opt/venv/bin/python3 -e ML_DIR=/app/ml spine-vision
+```
+
+### 16.4 Frontend
+
+A static Vite build. `VITE_*` values are inlined at **build** time, so changing
+the API URL requires a rebuild, not a restart.
+
+Any host works; the deep-link rewrite is the only requirement, since the router
+is client-side and a refresh on `/dashboard` otherwise 404s:
+
+| Host | Rewrite |
+|---|---|
+| Vercel | `frontend/vercel.json` (committed) |
+| Static file server | `serve -s dist` |
+| Amplify / Render / Netlify | `/*` → `/index.html`, rewrite (not redirect) |
+
+### 16.5 Storage Is Ephemeral
+
+`uploads/` lives in the container filesystem. A redeploy discards it.
+
+Scan **records** survive in MongoDB — status, mask, metrics, severities and the
+generated report are all document fields. The **files** do not: the original
+X-ray and the overlay images are referenced by path, so history rows for older
+scans lose their imagery after a redeploy while the report remains readable.
+
+This is a deliberate accepted limitation rather than an oversight. Making it
+durable means either object storage or a mounted volume; see §18.3.
+
+### 16.6 Order of Operations
+
+The two URLs are circular, so:
+
+1. Deploy the API. Verify `GET /api/health` returns `mlEnabled: true`.
+2. Deploy the frontend with `VITE_API_BASE_URL` pointed at it.
+3. Set `CORS_ORIGIN` on the API to the frontend origin. Redeploy.
+4. Register, upload, and confirm the scan reaches `complete`.
+
+Step 4 is the only end-to-end proof: `/api/health` reports configuration, not
+whether Python can actually run.
+
+---
+
+## 17. Diagram Source Material
 
 Condensed inputs for UML work.
 
-### 16.1 Use Case Diagram
+### 17.1 Use Case Diagram
 
 **Actors:** Guest · Registered User · Developer (specialised User) ·
 Segmentation Model · Diagnostic Engine · LLM Provider (external systems)
@@ -1248,7 +1358,7 @@ Segmentation Model · Diagnostic Engine · LLM Provider (external systems)
 | Download PDF | User | «extend» View report |
 | View scan history | User | «extend» View results |
 
-### 16.2 Class Diagram — Backend
+### 17.2 Class Diagram — Backend
 
 ```
 «entity» User                    «entity» Scan
@@ -1298,7 +1408,7 @@ Segmentation Model · Diagnostic Engine · LLM Provider (external systems)
 `LlmReportService, LlmAssistService → LlmClient` ·
 `Controllers → Services → Models`.
 
-### 16.3 Sequence Diagrams to Draw
+### 17.3 Sequence Diagrams to Draw
 
 1. **Registration** — §7.2
 2. **Login** — §7.3
@@ -1312,14 +1422,14 @@ Segmentation Model · Diagnostic Engine · LLM Provider (external systems)
    `buildFindingsBlock` → `chat` → answer
 8. **Restart recovery** — boot → `connectDb` → `failInterruptedScans` → update
 
-### 16.4 Activity / Flowchart Candidates
+### 17.4 Activity / Flowchart Candidates
 
 - Two mask paths decision — §8.3
 - Scan status state machine — §5.4
 - Compression-fracture corner detection (rotate → band → corners → ratio → band)
 - LLM fallback (key present? → stream/chat; else → template)
 
-### 16.5 Component / Deployment Diagram
+### 17.5 Component / Deployment Diagram
 
 **Nodes:** Browser · Node process (:5001) · MongoDB (:27018 embedded) ·
 Python subprocesses (short-lived) · File system · External LLM (HTTPS)
@@ -1327,7 +1437,7 @@ Python subprocesses (short-lived) · File system · External LLM (HTTPS)
 **Interfaces:** REST/JSON · multipart/form-data · `text/event-stream` ·
 `execFile` + stdout JSON · Mongoose wire protocol · HTTPS
 
-### 16.6 Key Numbers for the Report
+### 17.6 Key Numbers for the Report
 
 | Metric | Value |
 |---|---|
@@ -1345,14 +1455,17 @@ Python subprocesses (short-lived) · File system · External LLM (HTTPS)
 | Diagnostic time | < 1 s |
 | Report generation | ≈ 20 s |
 | Rate limit | 12 AI req/min/user |
+| Container image | ~2.7 GB |
+| Peak memory, full scan | ~764 MiB |
+| Idle memory | ~50 MiB |
 
 ---
 
-## 17. Known Limitations
+## 18. Known Limitations
 
 Stated plainly, because an honest report needs them.
 
-### 17.1 DICOM Is Accepted but Cannot Be Processed
+### 18.1 DICOM Is Accepted but Cannot Be Processed
 
 `.dcm` passes upload validation on both sides — `ACCEPTED_FILES` in
 `lib/constants.js` lists it, and `ALLOWED_IMAGE` in `middleware/upload.js`
@@ -1367,7 +1480,7 @@ until a decoder (`pydicom` → array → the existing path) is wired in, which w
 also be the natural place to add the magic-byte check that extension/MIME
 filtering does not give.
 
-### 17.2 Measurement Method Caveats
+### 18.2 Measurement Method Caveats
 
 - **Spondylolisthesis is measured centroid-to-centroid**, not from the posterior
   vertebral corners as in a manual Meyerding grading. Normal lumbar lordosis
@@ -1385,7 +1498,7 @@ filtering does not give.
 - A wedged vertebra is not specific to acute fracture — old healed fractures,
   congenital variants and osteoporotic remodelling all produce it.
 
-### 17.3 Architectural
+### 18.3 Architectural
 
 - **Single-process pipeline.** No job queue; concurrency is bounded by the box.
   A restart fails in-flight scans rather than resuming them.
@@ -1395,10 +1508,15 @@ filtering does not give.
 - **Upload validation is by extension and MIME type only** — no magic-byte
   check, so a renamed file is caught by the decoder rather than the filter
   (see 17.1).
+- **Uploaded and generated images do not survive a redeploy.** `uploads/` is
+  container-local, so a hosted instance keeps every scan *record* but loses the
+  X-ray and the overlays. History rows for older scans render without imagery
+  while their reports stay intact. Object storage or a mounted volume would fix
+  it; neither is wired in (see §16.5).
 - **No automated test suite.** Verification to date has been manual and
   browser-driven.
 
-### 17.4 Model
+### 18.4 Model
 
 The checkpoint measured well against hand annotations on the validation image
 used during development, but **no systematic evaluation across the full test
@@ -1408,7 +1526,7 @@ performs substantially better than those logs suggest.
 
 ---
 
-## 18. Glossary
+## 19. Glossary
 
 | Term | Meaning |
 |---|---|
