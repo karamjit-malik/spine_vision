@@ -124,7 +124,7 @@ keep the language layer from inventing anything.
 | **Routes** | URL → middleware chain → controller. No logic. | Controllers, middleware |
 | **Middleware** | Auth, validation, upload, rate limiting, error shaping | Services (auth only) |
 | **Controllers** | HTTP concerns: read request, call service, shape response | Services, models |
-| **Services** | Business logic, orchestration, external processes | Models, bridges, other services |
+| **Services** | Business logic, orchestration, external processes | Models, bridges, other services  |
 | **Bridges** | Spawn Python via `execFile`, parse stdout JSON | Python scripts |
 | **Models** | Mongoose schemas and instance methods | — |
 
