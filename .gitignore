@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+
+# Never commit real secrets — .env.example carries the shape instead.
+.env
+.env.*
+!.env.example
+
+*.log

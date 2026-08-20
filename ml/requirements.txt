@@ -1,0 +1,9 @@
+# Diagnostic scripts (stage 3) — geometry only, no model weights needed.
+numpy>=1.26
+opencv-python-headless>=4.8
+Pillow>=10.0
+
+# Segmentation (stage 2) — ml/segment.py, YOLO11 via ultralytics.
+ultralytics>=8.3
+torch>=2.2
+torchvision>=0.17

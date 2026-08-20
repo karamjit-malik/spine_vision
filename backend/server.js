@@ -1,0 +1,67 @@
+import express from "express";
+import cors from "cors";
+import morgan from "morgan";
+import fs from "fs";
+import { env } from "./config/env.js";
+import { connectDb } from "./config/db.js";
+import { authRouter } from "./routes/auth.js";
+import { scanRouter } from "./routes/scan.js";
+import { errorHandler, notFound } from "./middleware/errorHandler.js";
+import { failInterruptedScans } from "./services/pipelineRunner.js";
+
+/**
+ * Allow every configured origin (CORS_ORIGIN accepts a comma-separated list).
+ * In development also allow any localhost/127.0.0.1 port, so a Vite dev server
+ * that drifts to 5174 because 5173 was taken still reaches the API.
+ */
+function corsOrigin(origin, callback) {
+  // Same-origin requests, curl and health checks send no Origin header.
+  if (!origin) return callback(null, true);
+
+  const allowed = env.corsOrigin.split(",").map((value) => value.trim());
+  if (allowed.includes(origin)) return callback(null, true);
+
+  if (env.nodeEnv !== "production" && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+    return callback(null, true);
+  }
+
+  return callback(new Error(`Origin ${origin} is not allowed by CORS`));
+}
+
+const app = express();
+
+// Behind Render/Vercel's proxy, so req.ip is the real client rather than the
+// proxy — the AI rate limiter meters per user, but this keeps logs honest.
+if (env.nodeEnv === "production") app.set("trust proxy", 1);
+
+app.use(cors({ origin: corsOrigin, credentials: true }));
+app.use(express.json({ limit: "1mb" }));
+app.use(morgan("dev"));
+
+app.get("/api/health", (_req, res) =>
+  res.json({ success: true, data: { status: "ok", mlEnabled: env.mlEnabled } })
+);
+
+app.use("/api/auth", authRouter);
+app.use("/api/scan", scanRouter);
+
+// uploads/ is never served statically — images go through the authenticated
+// /api/scan/image route so only the owning user can read them.
+app.use(notFound);
+app.use(errorHandler);
+
+async function start() {
+  fs.mkdirSync(env.uploadDir, { recursive: true });
+  await connectDb();
+  await failInterruptedScans();
+  app.listen(env.port, () =>
+    console.log(`[server] listening on http://localhost:${env.port}`)
+  );
+}
+
+start().catch((error) => {
+  console.error("[server] failed to start", error);
+  process.exit(1);
+});
+
+export { app };

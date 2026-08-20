@@ -1,0 +1,10 @@
+**/node_modules
+**/.env
+**/.env.*
+!**/.env.example
+ml/venv
+ml/models/*.pt
+backend/uploads/*
+backend/.mongo-data
+frontend
+.git
